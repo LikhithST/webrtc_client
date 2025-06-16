@@ -1,0 +1,8 @@
+{
+    "serverAddress": "127.0.0.1",
+    "serverPort": 55555,
+    "insecure": true,
+    "certsDir": "tbd",
+    "TokenOrTokenfile": "tbd",
+    "protocol": "grpc"
+}

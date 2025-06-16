@@ -14,6 +14,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/LikhithST/webRTC_client/kuksa_client"
 	fastclock "github.com/likhith/fastclock"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -38,6 +40,13 @@ const (
 	oggPageDuration = time.Millisecond * 20
 	httpEndpoint    = "https://webrtc.hopto.org:8080/offer" // Replace with your HTTP endpoint URL
 )
+
+type ControlSignalMessage struct {
+	Signal string `json:"signal,omitempty"`
+	Value  int    `json:"value,omitempty"`
+}
+
+// var messageChan = make(chan DataChannelMessage, 100)
 
 type DataChannelMessage struct {
 	FrameID                int64  `json:"frameID"`
@@ -128,6 +137,24 @@ var stats = struct {
 	),
 }
 
+func isRaspberryPi() bool {
+	file, err := os.Open("/proc/cpuinfo")
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "Raspberry Pi") || strings.Contains(line, "BCM") {
+			return true
+		}
+	}
+
+	return false
+}
+
 func init() {
 	// we need to register the counter so prometheus can collect this metric
 	log.Println("init() function called")
@@ -142,11 +169,57 @@ func init() {
 		stats.LatencySfu1ToClient1,
 		stats.LatencyEndToEnd,
 	)
+
 }
 
-func main() {
+func startKuksaClient() {
+	// This function is a placeholder for starting the Kuksa client.
+	// You can implement the Kuksa client logic here if needed.
+	fmt.Println("Starting Kuksa client...")
+	var configKuksaClient kuksa_client.KuksaClientConfig
+	kuksa_client.ReadConfig(&configKuksaClient)
 
+	var backend kuksa_client.KuksaBackend = &kuksa_client.KuksaClientCommGrpc{Config: &configKuksaClient}
+	err := backend.ConnectToKuksaVal()
+	if err != nil {
+		log.Fatalf("Connection Error: %v", err)
+	}
+	defer backend.Close()
+
+	for {
+		if testing != nil && !*testing {
+			data := <-control_signal_channel
+			var controlSignal ControlSignalMessage
+			err = json.Unmarshal(data, &controlSignal)
+			if err != nil {
+				log.Printf("Unmarshal Error: %v", err)
+				continue
+			}
+			err = backend.SetValueFromKuksaVal(controlSignal.Signal, strconv.Itoa(controlSignal.Value), "value")
+
+			if err != nil {
+				log.Printf("Set Value Error: %v", err)
+			} else {
+				log.Printf("%s: %d", controlSignal.Signal, controlSignal.Value)
+			}
+
+		}
+	}
+
+}
+
+var control_signal_channel = make(chan []byte)
+var testing = flag.Bool("testing", false, "Run in testing mode")
+
+func main() {
+	flag.Parse()
 	httpPromServer()
+
+	go func() {
+		log.Println("Starting Kuksa client in a separate goroutine")
+		startKuksaClient()
+	}()
+	log.Println("Kuksa client started")
 	// Assert that we have an audio or video file
 	_, err := os.Stat(videoFileName)
 	haveVideoFile := !os.IsNotExist(err)
@@ -229,33 +302,38 @@ func main() {
 
 	// Register text message handling
 	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		var frameData DataChannelMessage
-		err := json.Unmarshal(msg.Data, &frameData)
-		if err != nil {
-			fmt.Println("Error unmarshalling:", err)
-			return
+		if testing != nil && *testing {
+			var frameData DataChannelMessage
+			err := json.Unmarshal(msg.Data, &frameData)
+			if err != nil {
+				fmt.Println("Error unmarshalling:", err)
+				return
+			}
+			// frameData.MessageSentTimeClient1 = NewHybridClock.Now().UnixMilli()
+			frameData.MessageSentTimeClient1 = time.Now().UnixMilli()
+			stats.FrameID.WithLabelValues("FrameID").Set(float64(frameData.FrameID))
+			stats.MessageSentTimeClient2.WithLabelValues("MessageSentTimeClient2").Set(float64(frameData.MessageSentTimeClient2))
+			stats.MessageSentTimeSfu2.WithLabelValues("MessageSentTimeSfu2").Set(float64(frameData.MessageSentTimeSfu2))
+			stats.MessageSentTimeSfu1.WithLabelValues("MessageSentTimeSfu1").Set(float64(frameData.MessageSentTimeSfu1))
+			stats.MessageSentTimeClient1.WithLabelValues("MessageSentTimeClient1").Set(float64(frameData.MessageSentTimeClient1))
+			stats.LatencyEndToEnd.WithLabelValues("LatencyEndToEnd").Set(
+				float64(frameData.MessageSentTimeClient1 - frameData.MessageSentTimeClient2))
+			stats.LatencyClient2ToSfu2.WithLabelValues("LatencyClient2ToSfu2").Set(
+				float64(frameData.MessageSentTimeSfu2 - frameData.MessageSentTimeClient2),
+			)
+			stats.LatencySfu2ToSfu1.WithLabelValues("LatencySfu2ToSfu1").Set(
+				float64(frameData.MessageSentTimeSfu1 - frameData.MessageSentTimeSfu2),
+			)
+			stats.LatencySfu1ToClient1.WithLabelValues("LatencySfu1ToClient1").Set(
+				float64(frameData.MessageSentTimeClient1 - frameData.MessageSentTimeSfu1),
+			)
+			frameData.LatencyEndToEnd = frameData.MessageSentTimeClient1 - frameData.MessageSentTimeClient2
+			// fmt.Printf("Message from DataChannel '%s': \n frameID: '%d', client2: '%d', sfu2: '%d', sfu1: '%d', client1: '%d'\n", dataChannel.Label(), frameData.FrameID, frameData.MessageSentTimeClient2, frameData.MessageSentTimeSfu2, frameData.MessageSentTimeSfu1, frameData.MessageSentTimeClient1)
+			logChan <- frameData
+		} else {
+			control_signal_channel <- msg.Data
 		}
-		// frameData.MessageSentTimeClient1 = NewHybridClock.Now().UnixMilli()
-		frameData.MessageSentTimeClient1 = time.Now().UnixMilli()
-		stats.FrameID.WithLabelValues("FrameID").Set(float64(frameData.FrameID))
-		stats.MessageSentTimeClient2.WithLabelValues("MessageSentTimeClient2").Set(float64(frameData.MessageSentTimeClient2))
-		stats.MessageSentTimeSfu2.WithLabelValues("MessageSentTimeSfu2").Set(float64(frameData.MessageSentTimeSfu2))
-		stats.MessageSentTimeSfu1.WithLabelValues("MessageSentTimeSfu1").Set(float64(frameData.MessageSentTimeSfu1))
-		stats.MessageSentTimeClient1.WithLabelValues("MessageSentTimeClient1").Set(float64(frameData.MessageSentTimeClient1))
-		stats.LatencyEndToEnd.WithLabelValues("LatencyEndToEnd").Set(
-			float64(frameData.MessageSentTimeClient1 - frameData.MessageSentTimeClient2))
-		stats.LatencyClient2ToSfu2.WithLabelValues("LatencyClient2ToSfu2").Set(
-			float64(frameData.MessageSentTimeSfu2 - frameData.MessageSentTimeClient2),
-		)
-		stats.LatencySfu2ToSfu1.WithLabelValues("LatencySfu2ToSfu1").Set(
-			float64(frameData.MessageSentTimeSfu1 - frameData.MessageSentTimeSfu2),
-		)
-		stats.LatencySfu1ToClient1.WithLabelValues("LatencySfu1ToClient1").Set(
-			float64(frameData.MessageSentTimeClient1 - frameData.MessageSentTimeSfu1),
-		)
-		frameData.LatencyEndToEnd = frameData.MessageSentTimeClient1 - frameData.MessageSentTimeClient2
-		// fmt.Printf("Message from DataChannel '%s': \n frameID: '%d', client2: '%d', sfu2: '%d', sfu1: '%d', client1: '%d'\n", dataChannel.Label(), frameData.FrameID, frameData.MessageSentTimeClient2, frameData.MessageSentTimeSfu2, frameData.MessageSentTimeSfu1, frameData.MessageSentTimeClient1)
-		logChan <- frameData
+
 	})
 
 	iceConnectedCtx, iceConnectedCtxCancel := context.WithCancel(context.Background())
